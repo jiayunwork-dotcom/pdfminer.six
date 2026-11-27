@@ -54,6 +54,8 @@ class PDFPage:
         """
         self.doc = doc
         self.pageid = pageid
+        # Zero-based index in document page order, when created by get_pages.
+        self.page_index: Optional[int] = None
         self.attrs = dict_value(attrs)
         self.label = label
         self.lastmod = resolve1(self.attrs.get("LastModified"))
@@ -169,6 +171,7 @@ class PDFPage:
                 log.warning(warning_msg)
         # Process each page contained in the document.
         for (pageno, page) in enumerate(cls.create_pages(doc)):
+            page.page_index = pageno
             if pagenos and (pageno not in pagenos):
                 continue
             yield page

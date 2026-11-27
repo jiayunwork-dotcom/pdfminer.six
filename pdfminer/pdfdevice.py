@@ -1,4 +1,5 @@
 from typing import (
+    Any,
     BinaryIO,
     Iterable,
     List,
@@ -34,6 +35,9 @@ class PDFDevice:
     def __init__(self, rsrcmgr: "PDFResourceManager") -> None:
         self.rsrcmgr = rsrcmgr
         self.ctm: Optional[Matrix] = None
+        # Source spans aligned with the seq argument of render_string.
+        # None keeps the historical decoding/rendering path untouched.
+        self.current_source_spans: Optional[Sequence[Optional[Sequence[Any]]]] = None
 
     def __repr__(self) -> str:
         return "<PDFDevice>"
@@ -162,12 +166,38 @@ class PDFTextDevice(PDFDevice):
     ) -> Point:
         (x, y) = pos
         needcharspace = False
-        for obj in seq:
+        for obj_index, obj in enumerate(seq):
             if isinstance(obj, (int, float)):
                 x -= obj * dxscale
                 needcharspace = True
             else:
-                for cid in font.decode(obj):
+                operand_sources = (
+                    None
+                    if self.current_source_spans is None
+                    else self.current_source_spans[obj_index]
+                )
+                if operand_sources is None:
+                    # Historical fast path when source mapping is disabled.
+                    for cid in font.decode(obj):
+                        if needcharspace:
+                            x += charspace
+                        x += self.render_char(
+                            utils.translate_matrix(matrix, (x, y)),
+                            font,
+                            fontsize,
+                            scaling,
+                            rise,
+                            cid,
+                            ncs,
+                            graphicstate,
+                        )
+                        if cid == 32 and wordspace:
+                            x += wordspace
+                        needcharspace = True
+                    continue
+
+                for source in operand_sources:
+                    cid = cast(int, source.cid)
                     if needcharspace:
                         x += charspace
                     x += self.render_char(
@@ -179,6 +209,7 @@ class PDFTextDevice(PDFDevice):
                         cid,
                         ncs,
                         graphicstate,
+                        source=source,
                     )
                     if cid == 32 and wordspace:
                         x += wordspace
@@ -202,12 +233,38 @@ class PDFTextDevice(PDFDevice):
     ) -> Point:
         (x, y) = pos
         needcharspace = False
-        for obj in seq:
+        for obj_index, obj in enumerate(seq):
             if isinstance(obj, (int, float)):
                 y -= obj * dxscale
                 needcharspace = True
             else:
-                for cid in font.decode(obj):
+                operand_sources = (
+                    None
+                    if self.current_source_spans is None
+                    else self.current_source_spans[obj_index]
+                )
+                if operand_sources is None:
+                    # Historical fast path when source mapping is disabled.
+                    for cid in font.decode(obj):
+                        if needcharspace:
+                            y += charspace
+                        y += self.render_char(
+                            utils.translate_matrix(matrix, (x, y)),
+                            font,
+                            fontsize,
+                            scaling,
+                            rise,
+                            cid,
+                            ncs,
+                            graphicstate,
+                        )
+                        if cid == 32 and wordspace:
+                            y += wordspace
+                        needcharspace = True
+                    continue
+
+                for source in operand_sources:
+                    cid = cast(int, source.cid)
                     if needcharspace:
                         y += charspace
                     y += self.render_char(
@@ -219,6 +276,7 @@ class PDFTextDevice(PDFDevice):
                         cid,
                         ncs,
                         graphicstate,
+                        source=source,
                     )
                     if cid == 32 and wordspace:
                         y += wordspace
@@ -235,6 +293,7 @@ class PDFTextDevice(PDFDevice):
         cid: int,
         ncs: PDFColorSpace,
         graphicstate: "PDFGraphicState",
+        source: Optional[Any] = None,
     ) -> float:
         return 0
 

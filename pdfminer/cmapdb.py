@@ -75,6 +75,17 @@ class CMapBase:
     def decode(self, code: bytes) -> Iterable[int]:
         raise NotImplementedError
 
+    def decode_with_spans(
+        self, code: bytes
+    ) -> Iterable[Tuple[int, int, int]]:
+        """Yield ``(cid, start, end)`` byte spans for decoded codes.
+
+        The default is only valid for one-byte code spaces.  Concrete
+        multi-byte maps override it.
+        """
+        for i, cid in enumerate(self.decode(code)):
+            yield cid, i, i + 1
+
 
 class CMap(CMapBase):
     def __init__(self, **kwargs: Union[str, int]) -> None:
@@ -112,6 +123,27 @@ class CMap(CMapBase):
             else:
                 d = self.code2cid
 
+    def decode_with_spans(self, code: bytes) -> Iterator[Tuple[int, int, int]]:
+        """Decode while retaining the complete input byte span of each code."""
+        log.debug("decode_with_spans: %r, %r", self, code)
+        root = self.code2cid
+        d = root
+        span_start = 0
+        for pos, value in enumerate(code):
+            if value in d:
+                x = d[value]
+                if isinstance(x, int):
+                    yield x, span_start, pos + 1
+                    d = root
+                    span_start = pos + 1
+                else:
+                    d = cast(Dict[int, object], x)
+            else:
+                # Match CMap.decode's behaviour: an invalid continuation byte is
+                # consumed and decoding restarts at the following byte.
+                d = root
+                span_start = pos + 1
+
     def dump(
         self,
         out: TextIO = sys.stdout,
@@ -137,6 +169,11 @@ class IdentityCMap(CMapBase):
         else:
             return ()
 
+    def decode_with_spans(self, code: bytes) -> Iterator[Tuple[int, int, int]]:
+        for start in range(0, len(code) - 1, 2):
+            (cid,) = struct.unpack(">H", code[start : start + 2])
+            yield cid, start, start + 2
+
 
 class IdentityCMapByte(IdentityCMap):
     def decode(self, code: bytes) -> Tuple[int, ...]:
@@ -145,6 +182,10 @@ class IdentityCMapByte(IdentityCMap):
             return struct.unpack(">%dB" % n, code)
         else:
             return ()
+
+    def decode_with_spans(self, code: bytes) -> Iterator[Tuple[int, int, int]]:
+        for start, cid in enumerate(code):
+            yield cid, start, start + 1
 
 
 class UnicodeMap(CMapBase):

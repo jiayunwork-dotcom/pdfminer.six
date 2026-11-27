@@ -21,6 +21,25 @@ extract_text_to_fp
 .. autofunction:: extract_text_to_fp
 
 
+.. _api_extract_text_with_sources:
+
+extract_text_with_sources
+=========================
+
+.. currentmodule:: pdfminer.high_level
+.. autofunction:: extract_text_with_sources
+
+
+.. _api_source_map:
+
+SourceMap
+=========
+
+.. currentmodule:: pdfminer.sourcemap
+.. autoclass:: SourceMap
+   :members:
+
+
 .. _api_extract_pages:
 
 extract_pages

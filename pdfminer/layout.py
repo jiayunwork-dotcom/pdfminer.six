@@ -349,6 +349,8 @@ class LTAnno(LTItem, LTText):
 
     def __init__(self, text: str) -> None:
         self._text = text
+        # Layout-generated text has no native content-stream source.
+        self.source: Optional[object] = None
         return
 
     def get_text(self) -> str:
@@ -370,9 +372,13 @@ class LTChar(LTComponent, LTText):
         textdisp: Union[float, Tuple[Optional[float], float]],
         ncs: PDFColorSpace,
         graphicstate: PDFGraphicState,
+        source: Optional[object] = None,
     ) -> None:
         LTText.__init__(self)
         self._text = text
+        # NativeSource when source tracking is enabled; None for ordinary
+        # extraction and for characters without provenance.
+        self.source = source
         self.matrix = matrix
         self.fontname = font.fontname
         self.ncs = ncs

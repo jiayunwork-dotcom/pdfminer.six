@@ -18,6 +18,7 @@ from .layout import LAParams, LTPage
 from .pdfdevice import PDFDevice, TagExtractor
 from .pdfinterp import PDFResourceManager, PDFPageInterpreter
 from .pdfpage import PDFPage
+from .sourcemap import SourceMap, SourceMappedText
 from .utils import open_filename, FileOrName, AnyIO
 
 
@@ -37,6 +38,7 @@ def extract_text_to_fp(
     strip_control: bool = False,
     debug: bool = False,
     disable_caching: bool = False,
+    source_map: Optional[SourceMap] = None,
     **kwargs: Any,
 ) -> None:
     """Parses text from inf-file and writes to outfp file-like object.
@@ -64,6 +66,8 @@ def extract_text_to_fp(
     :param strip_control: Does what it says on the tin
     :param debug: Output more logging data
     :param disable_caching: Does what it says on the tin
+    :param source_map: Optional SourceMap to populate for text output.  When
+        ``outfp`` is a StringIO, it is bound automatically before return.
     :param other:
     :return: nothing, acting as it does on two streams. Use StringIO to get
         strings.
@@ -83,7 +87,12 @@ def extract_text_to_fp(
 
     if output_type == "text":
         device = TextConverter(
-            rsrcmgr, outfp, codec=codec, laparams=laparams, imagewriter=imagewriter
+            rsrcmgr,
+            outfp,
+            codec=codec,
+            laparams=laparams,
+            imagewriter=imagewriter,
+            source_map=source_map,
         )
 
     elif output_type == "xml":
@@ -121,7 +130,11 @@ def extract_text_to_fp(
         raise PDFValueError(msg)
 
     assert device is not None
-    interpreter = PDFPageInterpreter(rsrcmgr, device)
+    if source_map is not None and output_type != "text":
+        raise PDFValueError(
+            "source_map is only supported when output_type is 'text'"
+        )
+    interpreter = PDFPageInterpreter(rsrcmgr, device, source_map=source_map)
     for page in PDFPage.get_pages(
         inf,
         page_numbers,
@@ -133,6 +146,8 @@ def extract_text_to_fp(
         interpreter.process_page(page)
 
     device.close()
+    if source_map is not None and isinstance(outfp, StringIO):
+        source_map.bind_text(outfp.getvalue())
 
 
 def extract_text(
@@ -143,6 +158,7 @@ def extract_text(
     caching: bool = True,
     codec: str = "utf-8",
     laparams: Optional[LAParams] = None,
+    source_map: Optional[SourceMap] = None,
 ) -> str:
     """Parse and return the text contained in a PDF file.
 
@@ -155,6 +171,8 @@ def extract_text(
     :param codec: Text decoding codec
     :param laparams: An LAParams object from pdfminer.layout. If None, uses
         some default settings that often work well.
+    :param source_map: Optional SourceMap to populate with provenance for the
+        returned text.  The return value remains the extracted string.
     :return: a string containing all of the text extracted.
     """
     if laparams is None:
@@ -163,8 +181,14 @@ def extract_text(
     with open_filename(pdf_file, "rb") as fp, StringIO() as output_string:
         fp = cast(BinaryIO, fp)  # we opened in binary mode
         rsrcmgr = PDFResourceManager(caching=caching)
-        device = TextConverter(rsrcmgr, output_string, codec=codec, laparams=laparams)
-        interpreter = PDFPageInterpreter(rsrcmgr, device)
+        device = TextConverter(
+            rsrcmgr,
+            output_string,
+            codec=codec,
+            laparams=laparams,
+            source_map=source_map,
+        )
+        interpreter = PDFPageInterpreter(rsrcmgr, device, source_map=source_map)
 
         for page in PDFPage.get_pages(
             fp,
@@ -175,7 +199,44 @@ def extract_text(
         ):
             interpreter.process_page(page)
 
-        return output_string.getvalue()
+        text = output_string.getvalue()
+        if source_map is not None:
+            source_map.bind_text(text)
+        return text
+
+
+def extract_text_with_sources(
+    pdf_file: FileOrName,
+    password: str = "",
+    page_numbers: Optional[Container[int]] = None,
+    maxpages: int = 0,
+    caching: bool = True,
+    codec: str = "utf-8",
+    laparams: Optional[LAParams] = None,
+    document_name: Optional[str] = None,
+) -> SourceMappedText:
+    """Extract text and a document-bound Unicode interval source index.
+
+    See :class:`pdfminer.sourcemap.SourceMap` for the query API.
+    """
+    source_map = SourceMap(document_name=document_name)
+    text = extract_text(
+        pdf_file,
+        password=password,
+        page_numbers=page_numbers,
+        maxpages=maxpages,
+        caching=caching,
+        codec=codec,
+        laparams=laparams,
+        source_map=source_map,
+    )
+    return SourceMappedText(text, source_map)
+
+
+# Descriptive aliases used by some callers.
+extract_text_sources = extract_text_with_sources
+extract_text_with_source_map = extract_text_with_sources
+extract_source_map = extract_text_with_sources
 
 
 def extract_pages(
@@ -185,6 +246,7 @@ def extract_pages(
     maxpages: int = 0,
     caching: bool = True,
     laparams: Optional[LAParams] = None,
+    source_map: Optional[SourceMap] = None,
 ) -> Iterator[LTPage]:
     """Extract and yield LTPage objects
 
@@ -205,7 +267,9 @@ def extract_pages(
         fp = cast(BinaryIO, fp)  # we opened in binary mode
         resource_manager = PDFResourceManager(caching=caching)
         device = PDFPageAggregator(resource_manager, laparams=laparams)
-        interpreter = PDFPageInterpreter(resource_manager, device)
+        interpreter = PDFPageInterpreter(
+            resource_manager, device, source_map=source_map
+        )
         for page in PDFPage.get_pages(
             fp, page_numbers, maxpages=maxpages, password=password, caching=caching
         ):

@@ -900,6 +900,13 @@ class PDFFont:
     def decode(self, bytes: bytes) -> Iterable[int]:
         return bytearray(bytes)  # map(ord, bytes)
 
+    def decode_with_spans(
+        self, bytes: bytes
+    ) -> Iterable[Tuple[int, int, int]]:
+        """Decode and return the complete input byte span for each code."""
+        for i, cid in enumerate(self.decode(bytes)):
+            yield cid, i, i + 1
+
     def get_ascent(self) -> float:
         """Ascent above the baseline, in text space units"""
         return self.ascent * self.vscale
@@ -1179,6 +1186,11 @@ class PDFCIDFont(PDFFont):
 
     def decode(self, bytes: bytes) -> Iterable[int]:
         return self.cmap.decode(bytes)
+
+    def decode_with_spans(
+        self, bytes: bytes
+    ) -> Iterable[Tuple[int, int, int]]:
+        return self.cmap.decode_with_spans(bytes)
 
     def char_disp(self, cid: int) -> Union[float, Tuple[Optional[float], float]]:
         "Returns an integer for horizontal fonts, a tuple for vertical fonts."

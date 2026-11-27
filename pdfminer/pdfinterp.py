@@ -1,7 +1,18 @@
 import logging
 import re
 from io import BytesIO
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 from . import settings
 from .cmapdb import CMap
@@ -39,6 +50,9 @@ from .utils import Matrix, Point, PathSegment, Rect
 from .utils import choplist
 from .utils import mult_matrix
 
+if TYPE_CHECKING:
+    from .sourcemap import NativeSource, SourceMap, SourceCall
+
 log = logging.getLogger(__name__)
 
 
@@ -55,6 +69,8 @@ LITERAL_TEXT = LIT("Text")
 LITERAL_FONT = LIT("Font")
 LITERAL_FORM = LIT("Form")
 LITERAL_IMAGE = LIT("Image")
+
+TEXT_SHOW_OPERATORS = {"Tj", "TJ", "'", '"'}
 
 
 class PDFTextState:
@@ -245,6 +261,7 @@ class PDFContentParser(PSStackParser[Union[PSKeyword, PDFStream]]):
     def __init__(self, streams: Sequence[object]) -> None:
         self.streams = streams
         self.istream = 0
+        self.current_stream_index: Optional[int] = None
         # PSStackParser.__init__(fp=None) is safe only because we've overloaded
         # all the methods that would attempt to access self.fp without first
         # calling self.fillfp().
@@ -254,6 +271,7 @@ class PDFContentParser(PSStackParser[Union[PSKeyword, PDFStream]]):
         if not self.fp:
             if self.istream < len(self.streams):
                 strm = stream_value(self.streams[self.istream])
+                self.current_stream_index = self.istream
                 self.istream += 1
             else:
                 raise PSEOF("Unexpected EOF, file truncated?")
@@ -344,13 +362,29 @@ class PDFPageInterpreter:
     Reference: PDF Reference, Appendix A, Operator Summary
     """
 
-    def __init__(self, rsrcmgr: PDFResourceManager, device: PDFDevice) -> None:
+    def __init__(
+        self,
+        rsrcmgr: PDFResourceManager,
+        device: PDFDevice,
+        source_map: Optional["SourceMap"] = None,
+    ) -> None:
         self.rsrcmgr = rsrcmgr
         self.device = device
+        self.source_map = source_map
+        # Invocation path for the content stream currently being executed.
+        self.source_path: Tuple["SourceCall", ...] = ()
+        self._current_source_operator: Optional[Any] = None
+        self._source_stream_index: Optional[int] = None
+        self._source_text_operator_count = 0
+        self._source_do_order = 0
         return
 
     def dup(self) -> "PDFPageInterpreter":
-        return self.__class__(self.rsrcmgr, self.device)
+        duplicate = self.__class__(
+            self.rsrcmgr, self.device, source_map=self.source_map
+        )
+        duplicate.source_path = self.source_path
+        return duplicate
 
     def init_resources(self, resources: Dict[object, object]) -> None:
         """Prepare the fonts and XObjects listed in the Resource attribute."""
@@ -892,6 +926,39 @@ class PDFPageInterpreter:
         self.textstate.linematrix = (0, 0)
         return
 
+    def _build_source_operands(
+        self, seq: PDFStackT
+    ) -> Sequence[Optional[Sequence["NativeSource"]]]:
+        assert self.source_map is not None
+        operator_ref = self._current_source_operator
+        assert operator_ref is not None
+        font = self.textstate.font
+        assert font is not None
+
+        result: List[Optional[Sequence["NativeSource"]]] = []
+        string_index = -1
+        for operand_index, operand in enumerate(cast(Sequence[Any], seq)):
+            operand = resolve1(operand)
+            if not isinstance(operand, bytes):
+                result.append(None)
+                continue
+
+            string_index += 1
+            spans: List["NativeSource"] = []
+            for cid, start, end in font.decode_with_spans(operand):
+                source = self.source_map.add_native(
+                    operator_ref,
+                    operand_index=operand_index,
+                    string_index=string_index,
+                    byte_start=start,
+                    byte_end=end,
+                    cid=cid,
+                    code=operand[start:end],
+                )
+                spans.append(source)
+            result.append(spans)
+        return result
+
     def do_TJ(self, seq: PDFStackT) -> None:
         """Show text, allowing individual glyph positioning"""
         if self.textstate.font is None:
@@ -899,9 +966,25 @@ class PDFPageInterpreter:
                 raise PDFInterpreterError("No font specified!")
             return
         assert self.ncs is not None
-        self.device.render_string(
-            self.textstate, cast(PDFTextSeq, seq), self.ncs, self.graphicstate.copy()
-        )
+
+        old_source_spans = getattr(self.device, "current_source_spans", None)
+        source_operands = None
+        if self.source_map is not None:
+            source_operands = self._build_source_operands(seq)
+            if hasattr(self.device, "current_source_spans"):
+                self.device.current_source_spans = source_operands
+        try:
+            self.device.render_string(
+                self.textstate,
+                cast(PDFTextSeq, seq),
+                self.ncs,
+                self.graphicstate.copy(),
+            )
+        finally:
+            if self.source_map is not None and hasattr(
+                self.device, "current_source_spans"
+            ):
+                self.device.current_source_spans = old_source_spans
         return
 
     def do_Tj(self, s: PDFStackT) -> None:
@@ -955,9 +1038,23 @@ class PDFPageInterpreter:
                 raise PDFInterpreterError("Undefined xobject id: %r" % xobjid)
             return
         log.debug("Processing xobj: %r", xobj)
+        source_do_order = self._source_do_order
+        if self.source_map is not None:
+            # Count every resolved Do in the immediate parent stream.
+            self._source_do_order += 1
         subtype = xobj.get("Subtype")
         if subtype is LITERAL_FORM and "BBox" in xobj:
+            source_call = None
+            if self.source_map is not None:
+                source_call = self.source_map.make_call(
+                    parent_path=self.source_path,
+                    name=xobjid,
+                    xobject=xobj,
+                    call_order=source_do_order,
+                )
             interpreter = self.dup()
+            if source_call is not None:
+                interpreter.source_path = self.source_path + (source_call,)
             bbox = cast(Rect, list_value(xobj["BBox"]))
             matrix = cast(Matrix, list_value(xobj.get("Matrix", MATRIX_IDENTITY)))
             # According to PDF reference 1.7 section 4.9.1, XObjects in
@@ -993,6 +1090,8 @@ class PDFPageInterpreter:
             ctm = (0, 1, -1, 0, y1, -x0)
         else:
             ctm = (1, 0, 0, 1, -x0, -y0)
+        if self.source_map is not None:
+            self.source_map.begin_page(page)
         self.device.begin_page(page, ctm)
         self.render_contents(page.resources, page.contents, ctm=ctm)
         self.device.end_page(page)
@@ -1013,6 +1112,13 @@ class PDFPageInterpreter:
         )
         self.init_resources(resources)
         self.init_state(ctm)
+        if self.source_map is not None:
+            # Operator numbering restarts for each page/Form interpretation.
+            # Individual streams inside a /Contents array additionally reset
+            # when execute() sees the parser move to another stream.
+            self._source_stream_index = None
+            self._source_text_operator_count = 0
+            self._source_do_order = 0
         self.execute(list_value(streams))
         return
 
@@ -1029,6 +1135,30 @@ class PDFPageInterpreter:
                 break
             if isinstance(obj, PSKeyword):
                 name = keyword_name(obj)
+                if self.source_map is not None:
+                    stream_index = parser.current_stream_index
+                    if stream_index is None:
+                        stream_index = 0
+                    if stream_index != self._source_stream_index:
+                        self._source_stream_index = stream_index
+                        self._source_text_operator_count = 0
+                        self._source_do_order = 0
+                    self._current_source_operator = None
+                    if name in TEXT_SHOW_OPERATORS:
+                        try:
+                            source_stream = streams[stream_index]
+                        except IndexError:
+                            source_stream = streams[0]
+                        self._current_source_operator = (
+                            self.source_map.begin_operator(
+                                path=self.source_path,
+                                stream=cast(PDFStream, source_stream),
+                                content_index=stream_index,
+                                operator=name,
+                                operator_index=self._source_text_operator_count,
+                            )
+                        )
+                        self._source_text_operator_count += 1
                 method = "do_%s" % name.replace("*", "_a").replace('"', "_w").replace(
                     "'", "_q"
                 )

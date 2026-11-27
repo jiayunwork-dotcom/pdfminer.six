@@ -42,6 +42,7 @@ from .pdfinterp import PDFGraphicState, PDFResourceManager
 from .pdfpage import PDFPage
 from .pdftypes import PDFStream
 from .pdfexceptions import PDFValueError
+from .sourcemap import SourceMap
 from .utils import AnyIO, Point, Matrix, Rect, PathSegment, make_compat_str
 from .utils import apply_matrix_pt
 from .utils import bbox2str
@@ -228,6 +229,7 @@ class PDFLayoutAnalyzer(PDFTextDevice):
         cid: int,
         ncs: PDFColorSpace,
         graphicstate: PDFGraphicState,
+        source: Optional[object] = None,
     ) -> float:
         try:
             text = font.to_unichr(cid)
@@ -247,6 +249,7 @@ class PDFLayoutAnalyzer(PDFTextDevice):
             textdisp,
             ncs,
             graphicstate,
+            source,
         )
         self.cur_item.add(item)
         return item.adv
@@ -323,10 +326,12 @@ class TextConverter(PDFConverter[AnyIO]):
         laparams: Optional[LAParams] = None,
         showpageno: bool = False,
         imagewriter: Optional[ImageWriter] = None,
+        source_map: Optional[SourceMap] = None,
     ) -> None:
         super().__init__(rsrcmgr, outfp, codec=codec, pageno=pageno, laparams=laparams)
         self.showpageno = showpageno
         self.imagewriter = imagewriter
+        self.source_map = source_map
 
     def write_text(self, text: str) -> None:
         text = utils.compatible_encode_method(text, self.codec, "ignore")
@@ -336,22 +341,31 @@ class TextConverter(PDFConverter[AnyIO]):
             cast(TextIO, self.outfp).write(text)
 
     def receive_layout(self, ltpage: LTPage) -> None:
+        def emit(text: str, source: object = None) -> None:
+            self.write_text(text)
+            if self.source_map is not None:
+                self.source_map.append_output(text, source)
+
         def render(item: LTItem) -> None:
             if isinstance(item, LTContainer):
                 for child in item:
                     render(child)
             elif isinstance(item, LTText):
-                self.write_text(item.get_text())
+                text = item.get_text()
+                source = getattr(item, "source", None)
+                if not isinstance(item, LTChar):
+                    source = None
+                emit(text, source)
             if isinstance(item, LTTextBox):
-                self.write_text("\n")
+                emit("\n")
             elif isinstance(item, LTImage):
                 if self.imagewriter is not None:
                     self.imagewriter.export_image(item)
 
         if self.showpageno:
-            self.write_text("Page %s\n" % ltpage.pageid)
+            emit("Page %s\n" % ltpage.pageid)
         render(ltpage)
-        self.write_text("\f")
+        emit("\f")
 
     # Some dummy functions to save memory/CPU when all that is wanted
     # is text.  This stops all the image and drawing output from being

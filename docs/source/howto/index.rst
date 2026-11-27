@@ -12,3 +12,4 @@ How-to guides help you to solve specific problems with pdfminer.six.
     acro_forms
     toc_target_page
     character_properties
+    source_mapping
