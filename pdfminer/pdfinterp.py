@@ -30,7 +30,7 @@ from .pdffont import PDFType1Font
 from .pdffont import PDFType3Font
 from .pdfpage import PDFPage
 from .pdftypes import PDFObjRef
-from .pdfexceptions import PDFException
+from .pdfexceptions import PDFException, PDFValueError
 from .pdftypes import PDFStream
 from .pdftypes import dict_value
 from .pdftypes import list_value
@@ -51,6 +51,7 @@ from .utils import choplist
 from .utils import mult_matrix
 
 if TYPE_CHECKING:
+    from .layers import LayerPolicy
     from .sourcemap import NativeSource, SourceMap, SourceCall
 
 log = logging.getLogger(__name__)
@@ -367,25 +368,69 @@ class PDFPageInterpreter:
         rsrcmgr: PDFResourceManager,
         device: PDFDevice,
         source_map: Optional["SourceMap"] = None,
+        layer_policy: Optional["LayerPolicy"] = None,
     ) -> None:
         self.rsrcmgr = rsrcmgr
         self.device = device
         self.source_map = source_map
+        # When set, optional-content gates (BDC/OC and Form /OC) are evaluated
+        # against this policy and hidden content is not rendered.
+        self.layer_policy = layer_policy
         # Invocation path for the content stream currently being executed.
         self.source_path: Tuple["SourceCall", ...] = ()
         self._current_source_operator: Optional[Any] = None
         self._source_stream_index: Optional[int] = None
         self._source_text_operator_count = 0
         self._source_do_order = 0
+        # Gate stack with explicit scope markers ("ambient", "form", "bmc",
+        # "bdc").  Every pushed scope is popped by the matching EMC or when the
+        # nested Form interpretation ends, so parent gates survive the call.
+        self._layer_gate_stack: List[Tuple[str, Any]] = []
+        # Number of BMC/BDC scopes opened inside the currently interpreted
+        # stream (inherited parent scopes are not counted here).
+        self._marked_content_depth = 0
+        # True for interpreters spawned by do_Do: they inherit the parent's
+        # open gates instead of resetting visibility in render_contents.
+        self._nested_interpretation = False
+        self._init_visibility()
         return
+
+    def _init_visibility(self, gate: Any = None) -> None:
+        if self.layer_policy is None:
+            self._layer_gate_stack = []
+            self._marked_content_depth = 0
+            return
+        if gate is None:
+            gate = self.layer_policy.all_value
+        self._layer_gate_stack = [("ambient", gate)]
+        self._marked_content_depth = 0
+    @property
+    def _current_gate(self) -> Any:
+        if self.layer_policy is None:
+            return True
+        return self._layer_gate_stack[-1][1]
+
+    def _combine_gates(self, outer: Any, inner: Any) -> Any:
+        # Nested optional-content visibility is the conjunction of every
+        # enclosing gate (concrete bool or symbolic truth-table mask).
+        if self.layer_policy is None:
+            return True
+        return outer & inner
 
     def dup(self) -> "PDFPageInterpreter":
         duplicate = self.__class__(
-            self.rsrcmgr, self.device, source_map=self.source_map
+            self.rsrcmgr,
+            self.device,
+            source_map=self.source_map,
+            layer_policy=self.layer_policy,
         )
         duplicate.source_path = self.source_path
+        if self.layer_policy is not None:
+            # The child stream starts inside every gate currently open on its
+            # parent; Form-specific /OC gating is combined on top afterwards.
+            duplicate._layer_gate_stack = list(self._layer_gate_stack)
+            duplicate._marked_content_depth = self._marked_content_depth
         return duplicate
-
     def init_resources(self, resources: Dict[object, object]) -> None:
         """Prepare the fonts and XObjects listed in the Resource attribute."""
         self.resources = resources
@@ -792,23 +837,72 @@ class PDFPageInterpreter:
         self.device.do_tag(cast(PSLiteral, tag))
         return
 
-    def do_DP(self, tag: PDFStackT, props: PDFStackT) -> None:
+    def do_DP(self, *args: PDFStackT) -> None:
         """Define marked-content point with property list"""
-        self.device.do_tag(cast(PSLiteral, tag), props)
+        # The property operand is optional: "/Tag DP" is legal and simply
+        # carries no properties.
+        if self.layer_policy is not None and len(args) >= 2:
+            props = args[1]
+            if isinstance(props, (PSLiteral, str, dict)):
+                properties = dict_value(self.resources)
+                obj = self.layer_policy.resolve_property(props, properties)
+                if "OC" in obj:
+                    self.layer_policy.evaluate_oc_entry(obj["OC"])
+        self.device.do_tag(
+            cast(PSLiteral, args[0]), args[1] if len(args) >= 2 else None
+        )
         return
 
     def do_BMC(self, tag: PDFStackT) -> None:
         """Begin marked-content sequence"""
+        if self.layer_policy is not None:
+            self._marked_content_depth += 1
+            self._layer_gate_stack.append(("bmc", self._current_gate))
         self.device.begin_tag(cast(PSLiteral, tag))
         return
 
-    def do_BDC(self, tag: PDFStackT, props: PDFStackT) -> None:
+    def do_BDC(self, *args: PDFStackT) -> None:
         """Begin marked-content sequence with property list"""
-        self.device.begin_tag(cast(PSLiteral, tag), props)
+        tag = cast(PSLiteral, args[0])
+        props = args[1] if len(args) >= 2 else None
+        if self.layer_policy is not None:
+            properties = dict_value(self.resources)
+            if props is None:
+                # Common PDF shorthand: "/Name BDC" where /Name is itself a
+                # resource property reference rather than a separate tag.
+                resource_props = properties.get("Properties")
+                if resource_props is not None:
+                    resolved_props = dict_value(resource_props)
+                    tag_name = literal_name(tag)
+                    if tag in resolved_props or tag_name in resolved_props:
+                        props = tag_name
+            gate = self._current_gate
+            if props is not None:
+                resolved = self.layer_policy.resolve_property(props, properties)
+                if "OC" in resolved:
+                    gate = self._combine_gates(
+                        gate,
+                        self.layer_policy.evaluate_oc_entry(resolved["OC"]),
+                    )
+            self._marked_content_depth += 1
+            self._layer_gate_stack.append(("bdc", gate))
+        self.device.begin_tag(tag, props)
         return
 
     def do_EMC(self) -> None:
         """End marked-content sequence"""
+        if self.layer_policy is not None:
+            if self._marked_content_depth <= 0:
+                raise PDFValueError(
+                    "EMC without a matching BMC/BDC marked-content operator"
+                )
+            self._marked_content_depth -= 1
+            marker, _gate = self._layer_gate_stack.pop()
+            if marker not in ("bmc", "bdc"):
+                # An ambient/Form scope must never be closed by a stream's EMC.
+                raise PDFValueError(
+                    "EMC tried to close an ambient or Form visibility scope"
+                )
         self.device.end_tag()
         return
 
@@ -965,6 +1059,12 @@ class PDFPageInterpreter:
             if settings.STRICT:
                 raise PDFInterpreterError("No font specified!")
             return
+        if self.layer_policy is not None:
+            gate = self._current_gate
+            if not gate:
+                return
+            if hasattr(self.device, "ocg_value"):
+                self.device.ocg_value = gate
         assert self.ncs is not None
 
         old_source_spans = getattr(self.device, "current_source_spans", None)
@@ -1044,6 +1144,12 @@ class PDFPageInterpreter:
             self._source_do_order += 1
         subtype = xobj.get("Subtype")
         if subtype is LITERAL_FORM and "BBox" in xobj:
+            form_gate = None
+            if self.layer_policy is not None and "OC" in xobj:
+                form_gate = self._combine_gates(
+                    self._current_gate,
+                    self.layer_policy.evaluate_oc_entry(xobj["OC"]),
+                )
             source_call = None
             if self.source_map is not None:
                 source_call = self.source_map.make_call(
@@ -1055,6 +1161,16 @@ class PDFPageInterpreter:
             interpreter = self.dup()
             if source_call is not None:
                 interpreter.source_path = self.source_path + (source_call,)
+            if self.layer_policy is not None:
+                # The child stream inherits every gate currently open on its
+                # parent and, when the Form carries /OC, adds one conjunctive
+                # form scope.  Inherited BDC/BMC scopes remain the parent's
+                # responsibility: the child counts and balances only its own.
+                interpreter._layer_gate_stack = list(self._layer_gate_stack)
+                if form_gate is not None:
+                    interpreter._layer_gate_stack.append(("form", form_gate))
+                interpreter._marked_content_depth = 0
+                interpreter._nested_interpretation = True
             bbox = cast(Rect, list_value(xobj["BBox"]))
             matrix = cast(Matrix, list_value(xobj.get("Matrix", MATRIX_IDENTITY)))
             # According to PDF reference 1.7 section 4.9.1, XObjects in
@@ -1065,12 +1181,17 @@ class PDFPageInterpreter:
                 resources = dict_value(xobjres)
             else:
                 resources = self.resources.copy()
-            self.device.begin_figure(xobjid, bbox, matrix)
+            visible = self.layer_policy is None or self._current_gate
+            if visible:
+                self.device.begin_figure(xobjid, bbox, matrix)
             interpreter.render_contents(
                 resources, [xobj], ctm=mult_matrix(matrix, self.ctm)
             )
-            self.device.end_figure(xobjid)
+            if visible:
+                self.device.end_figure(xobjid)
         elif subtype is LITERAL_IMAGE and "Width" in xobj and "Height" in xobj:
+            if self.layer_policy is not None and not self._current_gate:
+                return
             self.device.begin_figure(xobjid, (0, 0, 1, 1), MATRIX_IDENTITY)
             self.device.render_image(xobjid, xobj)
             self.device.end_figure(xobjid)
@@ -1112,6 +1233,11 @@ class PDFPageInterpreter:
         )
         self.init_resources(resources)
         self.init_state(ctm)
+        if self.layer_policy is not None and not self._nested_interpretation:
+            # A top-level page/Form interpretation starts fully visible and
+            # with no open marked-content sequence.  Child interpreters created
+            # via dup() keep the inherited state configured in do_Do instead.
+            self._init_visibility()
         if self.source_map is not None:
             # Operator numbering restarts for each page/Form interpretation.
             # Individual streams inside a /Contents array additionally reset
@@ -1120,6 +1246,12 @@ class PDFPageInterpreter:
             self._source_text_operator_count = 0
             self._source_do_order = 0
         self.execute(list_value(streams))
+        if self.layer_policy is not None and self._marked_content_depth != 0:
+            raise PDFValueError(
+                "Unbalanced marked-content sequence: "
+                f"{self._marked_content_depth} BMC/BDC operator(s) in this "
+                "stream lack EMC"
+            )
         return
 
     def execute(self, streams: Sequence[object]) -> None:
@@ -1164,6 +1296,15 @@ class PDFPageInterpreter:
                 )
                 if hasattr(self, method):
                     func = getattr(self, method)
+                    if name in ("BDC", "DP"):
+                        # Variadic marked-content operators: the property list
+                        # operand is optional, so consume whatever the stream
+                        # actually supplied (one or two operands).
+                        nargs = min(len(self.argstack), 2)
+                        args = self.pop(nargs)
+                        log.debug("exec: %s %r", name, args)
+                        func(*args)
+                        continue
                     nargs = func.__code__.co_argcount - 1
                     if nargs:
                         args = self.pop(nargs)

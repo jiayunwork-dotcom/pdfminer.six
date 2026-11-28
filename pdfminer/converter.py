@@ -231,6 +231,8 @@ class PDFLayoutAnalyzer(PDFTextDevice):
         graphicstate: PDFGraphicState,
         source: Optional[object] = None,
     ) -> float:
+        if not getattr(self, "ocg_value", True):
+            return 0
         try:
             text = font.to_unichr(cid)
             assert isinstance(text, str), str(type(text))
@@ -332,6 +334,9 @@ class TextConverter(PDFConverter[AnyIO]):
         self.showpageno = showpageno
         self.imagewriter = imagewriter
         self.source_map = source_map
+        # Current optional-content gate value (bool or symbolic mask).  The
+        # page interpreter updates this when a LayerPolicy is installed.
+        self.ocg_value: object = True
 
     def write_text(self, text: str) -> None:
         text = utils.compatible_encode_method(text, self.codec, "ignore")

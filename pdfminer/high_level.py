@@ -3,7 +3,7 @@
 import logging
 import sys
 from io import StringIO
-from typing import Any, BinaryIO, Container, Iterator, Optional, cast
+from typing import Any, BinaryIO, Container, Dict, Iterator, Optional, Tuple, cast
 
 from .pdfexceptions import PDFValueError
 from .converter import (
@@ -14,10 +14,21 @@ from .converter import (
     HOCRConverter,
 )
 from .image import ImageWriter
+from .layers import (
+    LayeredText,
+    LayerPolicy,
+    LayerQueryResult,
+    NativeSequenceDevice,
+    SymbolicLayerPolicy,
+    assignment_states,
+    symbolic_page_search,
+)
 from .layout import LAParams, LTPage
 from .pdfdevice import PDFDevice, TagExtractor
+from .pdfdocument import PDFDocument
 from .pdfinterp import PDFResourceManager, PDFPageInterpreter
 from .pdfpage import PDFPage
+from .pdfparser import PDFParser
 from .sourcemap import SourceMap, SourceMappedText
 from .utils import open_filename, FileOrName, AnyIO
 
@@ -39,6 +50,7 @@ def extract_text_to_fp(
     debug: bool = False,
     disable_caching: bool = False,
     source_map: Optional[SourceMap] = None,
+    layer_policy: Optional[LayerPolicy] = None,
     **kwargs: Any,
 ) -> None:
     """Parses text from inf-file and writes to outfp file-like object.
@@ -94,7 +106,6 @@ def extract_text_to_fp(
             imagewriter=imagewriter,
             source_map=source_map,
         )
-
     elif output_type == "xml":
         device = XMLConverter(
             rsrcmgr,
@@ -134,7 +145,15 @@ def extract_text_to_fp(
         raise PDFValueError(
             "source_map is only supported when output_type is 'text'"
         )
-    interpreter = PDFPageInterpreter(rsrcmgr, device, source_map=source_map)
+    if layer_policy is not None and output_type != "text":
+        raise PDFValueError(
+            "layer_policy is only supported when output_type is 'text'"
+        )
+    interpreter = PDFPageInterpreter(
+        rsrcmgr, device, source_map=source_map, layer_policy=layer_policy
+    )
+    if layer_policy is not None and hasattr(device, "ocg_value"):
+        device.ocg_value = layer_policy.all_value
     for page in PDFPage.get_pages(
         inf,
         page_numbers,
@@ -159,6 +178,7 @@ def extract_text(
     codec: str = "utf-8",
     laparams: Optional[LAParams] = None,
     source_map: Optional[SourceMap] = None,
+    layer_policy: Optional[LayerPolicy] = None,
 ) -> str:
     """Parse and return the text contained in a PDF file.
 
@@ -188,7 +208,14 @@ def extract_text(
             laparams=laparams,
             source_map=source_map,
         )
-        interpreter = PDFPageInterpreter(rsrcmgr, device, source_map=source_map)
+        interpreter = PDFPageInterpreter(
+            rsrcmgr,
+            device,
+            source_map=source_map,
+            layer_policy=layer_policy,
+        )
+        if layer_policy is not None and hasattr(device, "ocg_value"):
+            device.ocg_value = layer_policy.all_value
 
         for page in PDFPage.get_pages(
             fp,
@@ -237,6 +264,135 @@ def extract_text_with_sources(
 extract_text_sources = extract_text_with_sources
 extract_text_with_source_map = extract_text_with_sources
 extract_source_map = extract_text_with_sources
+
+
+def _interpret_native(
+    document: PDFDocument,
+    policy: Any,
+    device: NativeSequenceDevice,
+) -> NativeSequenceDevice:
+    rsrcmgr = PDFResourceManager()
+    interpreter = PDFPageInterpreter(rsrcmgr, device, layer_policy=policy)
+    device.ocg_value = policy.all_value
+    for index, page in enumerate(PDFPage.create_pages(document)):
+        page.page_index = index
+        interpreter.process_page(page)
+    return device
+
+
+def extract_layered_text(
+    pdf_file: FileOrName,
+    states: Dict[int, bool],
+    password: str = "",
+) -> LayeredText:
+    """Extract native visible Unicode per page for one concrete OCG state.
+
+    Only native characters drawn under the given state table are returned, in
+    per-page drawing order; layout-generated whitespace and page breaks do not
+    participate.  The same :class:`~pdfminer.layers.LayerPolicy` drives the
+    interpreter and this extractor, so hidden BDC/Form content never reaches
+    the output.
+    """
+    with open_filename(pdf_file, "rb") as fp:
+        binary = cast(BinaryIO, fp)
+        document = PDFDocument(PDFParser(binary), password=password)
+        policy = LayerPolicy(document, states)
+        device = NativeSequenceDevice(PDFResourceManager())
+        _interpret_native(document, policy, device)
+    pages = tuple(
+        "".join(character for character, _gate in entries)
+        for entries in device.pages
+    )
+    return LayeredText(pages=pages, states=dict(policy.states))
+
+
+def find_layer_state_for_text(
+    pdf_file: FileOrName,
+    target: str,
+    states: Dict[int, bool],
+    password: str = "",
+) -> Optional[LayerQueryResult]:
+    """Find the minimum-flip OCG state revealing ``target`` on one page.
+
+    :param pdf_file: path or file-like object for an unencrypted PDF.
+    :param target: non-empty native Unicode string; matching never crosses a
+        page boundary.
+    :param states: complete boolean state table keyed by catalog OCG indirect
+        object numbers.  Missing/extra groups or invalid references raise
+        :class:`ValueError`.
+    :returns: a :class:`LayerQueryResult` with a complete flipped state table,
+        the hit page and the flip count, or ``None`` when no assignment can
+        reveal the target.  Ties are broken by the lowest assignment integer.
+    """
+    if not isinstance(target, str) or not target:
+        raise PDFValueError("Target text must be a non-empty string")
+    with open_filename(pdf_file, "rb") as fp:
+        binary = cast(BinaryIO, fp)
+        document = PDFDocument(PDFParser(binary), password=password)
+        # Constructing the concrete policy validates the complete state table
+        # up front; the symbolic policy reuses the same catalog checks below.
+        LayerPolicy(document, states)
+        policy = SymbolicLayerPolicy(document)
+        device = NativeSequenceDevice(PDFResourceManager())
+        _interpret_native(document, policy, device)
+        ocg_object_numbers = policy.ocg_object_numbers
+
+        best: Optional[Tuple[int, int, int]] = None
+        for page_index, entries in enumerate(device.pages):
+            feasible = symbolic_page_search(entries, target, policy)
+            if not feasible:
+                continue
+            for assignment in feasible:
+                flips = (
+                    assignment
+                    ^ sum(
+                        (1 if states[objid] else 0) << index
+                        for index, objid in enumerate(ocg_object_numbers)
+                    )
+                ).bit_count()
+                candidate = (flips, assignment, page_index)
+                if best is None or candidate < best:
+                    best = candidate
+
+        if best is None:
+            return None
+        flips, assignment, page_index = best
+        result_states = assignment_states(ocg_object_numbers, assignment)
+
+        # Second, concrete interpretation of the hit page only: proves that the
+        # regular extraction pipeline reproduces the target under the returned
+        # state (every page/Form instance is still interpreted at most twice).
+        verify_device = NativeSequenceDevice(PDFResourceManager())
+        verify_policy = LayerPolicy(document, result_states)
+        rsrcmgr = PDFResourceManager()
+        interpreter = PDFPageInterpreter(
+            rsrcmgr, verify_device, layer_policy=verify_policy
+        )
+        verify_device.ocg_value = verify_policy.all_value
+        verify_pages = [
+            page
+            for index, page in enumerate(PDFPage.create_pages(document))
+            if index == page_index
+        ]
+        assert len(verify_pages) == 1
+        verify_pages[0].page_index = page_index
+        interpreter.process_page(verify_pages[0])
+        visible = "".join(
+            character for character, _gate in verify_device.pages[0]
+        )
+        if target not in visible:
+            # Defensive: symbolic and concrete backends share one parser.
+            raise PDFValueError(
+                "Layer query internal error: the selected state does not "
+                "reproduce the target during concrete extraction"
+            )
+
+    return LayerQueryResult(
+        states=result_states,
+        page_index=page_index,
+        page_number=page_index + 1,
+        flips=flips,
+    )
 
 
 def extract_pages(

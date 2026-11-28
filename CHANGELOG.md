@@ -3,6 +3,19 @@ All notable changes in pdfminer.six will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Added
+
+- Optional content group (OCG) support: a `LayerPolicy` evaluates BDC/DP
+  marked-content gates (direct dictionaries and resource property names),
+  Form `/OC` entries and OCMD memberships including `/VE` And/Or/Not
+  expressions and the `/P` policies.  New `find_layer_state_for_text`
+  query returns the minimum-flip complete OCG state table (and hit page)
+  that reveals a target native string, or `None` when impossible, while
+  `extract_layered_text` extracts the native visible Unicode sequence under
+  a concrete state.  Unencrypted PDFs with up to 16 groups are supported.
+
 ## [20240706]
 
 ### Added
