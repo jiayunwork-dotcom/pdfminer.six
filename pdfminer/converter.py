@@ -41,7 +41,7 @@ from .pdffont import PDFUnicodeNotDefined
 from .pdfinterp import PDFGraphicState, PDFResourceManager
 from .pdfpage import PDFPage
 from .pdftypes import PDFStream
-from .pdfexceptions import PDFValueError
+from .pdfexceptions import PDFValueError, PDFIOError
 from .sourcemap import SourceMap
 from .utils import AnyIO, Point, Matrix, Rect, PathSegment, make_compat_str
 from .utils import apply_matrix_pt
@@ -333,18 +333,32 @@ class TextConverter(PDFConverter[AnyIO]):
         self.imagewriter = imagewriter
         self.source_map = source_map
 
-    def write_text(self, text: str) -> None:
+    def write_text(self, text: str) -> str:
         text = utils.compatible_encode_method(text, self.codec, "ignore")
         if self.outfp_binary:
-            cast(BinaryIO, self.outfp).write(text.encode())
-        else:
-            cast(TextIO, self.outfp).write(text)
+            encoded = text.encode(self.codec, errors="ignore")
+            written = cast(BinaryIO, self.outfp).write(encoded)
+            if written is not None and written < len(encoded):
+                raise PDFIOError(
+                    f"Output stream short write: {written} of {len(encoded)} bytes"
+                )
+            # The source index covers exactly the Unicode that survived the
+            # codec, i.e. the segment actually sent to the encoder.
+            return encoded.decode(self.codec, errors="ignore")
+        written = cast(TextIO, self.outfp).write(text)
+        if written is not None and written < len(text):
+            raise PDFIOError(
+                f"Output stream short write: {written} of {len(text)} characters"
+            )
+        return text
 
     def receive_layout(self, ltpage: LTPage) -> None:
         def emit(text: str, source: object = None) -> None:
-            self.write_text(text)
+            # Index exactly the Unicode segment handed to the stream; the
+            # codec filtering inside write_text may shorten it.
+            written_text = self.write_text(text)
             if self.source_map is not None:
-                self.source_map.append_output(text, source)
+                self.source_map.append_output(written_text, source)
 
         def render(item: LTItem) -> None:
             if isinstance(item, LTContainer):

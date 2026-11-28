@@ -510,10 +510,11 @@ class MemoryOrganizationTests(unittest.TestCase):
         self.assertTrue(all(s.operator_ref is op0[0].operator_ref for s in op0))
         self.assertTrue(all(s.path is op0[0].path for s in op0))
 
-        # The map stores no decoded content-stream container.
+        # The map stores no decoded content-stream container.  Stream uids
+        # are scoped to the per-extraction session and disappear on commit.
         self.assertFalse(hasattr(source_map, "content_streams"))
+        self.assertIsNone(source_map._session)
         gc.collect()
-        self.assertEqual(len(source_map._stream_uids), 0)
 
 
 if __name__ == "__main__":

@@ -66,8 +66,12 @@ def extract_text_to_fp(
     :param strip_control: Does what it says on the tin
     :param debug: Output more logging data
     :param disable_caching: Does what it says on the tin
-    :param source_map: Optional SourceMap to populate for text output.  When
-        ``outfp`` is a StringIO, it is bound automatically before return.
+    :param source_map: Optional SourceMap to populate for text output.  The
+        map is bound to the Unicode written by this call when the call
+        finishes successfully.  Reusing the same map starts an independent
+        extraction that replaces the previous binding on success and leaves
+        it untouched on failure; using a map while another extraction is
+        still in progress raises immediately.
     :param other:
     :return: nothing, acting as it does on two streams. Use StringIO to get
         strings.
@@ -134,20 +138,34 @@ def extract_text_to_fp(
         raise PDFValueError(
             "source_map is only supported when output_type is 'text'"
         )
+    if source_map is not None:
+        # Fails before any output is written if the same map is already
+        # serving an extraction that has not finished.
+        source_map.begin_extraction()
     interpreter = PDFPageInterpreter(rsrcmgr, device, source_map=source_map)
-    for page in PDFPage.get_pages(
-        inf,
-        page_numbers,
-        maxpages=maxpages,
-        password=password,
-        caching=not disable_caching,
-    ):
-        page.rotate = (page.rotate + rotation) % 360
-        interpreter.process_page(page)
+    try:
+        for page in PDFPage.get_pages(
+            inf,
+            page_numbers,
+            maxpages=maxpages,
+            password=password,
+            caching=not disable_caching,
+        ):
+            page.rotate = (page.rotate + rotation) % 360
+            interpreter.process_page(page)
 
-    device.close()
-    if source_map is not None and isinstance(outfp, StringIO):
-        source_map.bind_text(outfp.getvalue())
+        device.close()
+    except BaseException:
+        if source_map is not None:
+            # Keep the previous committed result; text already written to
+            # outfp is intentionally left in place.
+            source_map.rollback_extraction()
+        raise
+    else:
+        if source_map is not None:
+            # Bind the exact Unicode the converter wrote this call.  Text
+            # that was already in outfp before this call is not part of it.
+            source_map.commit_extraction()
 
 
 def extract_text(
@@ -188,20 +206,31 @@ def extract_text(
             laparams=laparams,
             source_map=source_map,
         )
+        if source_map is not None:
+            # Fails before any text is produced if the map is already busy.
+            source_map.begin_extraction()
         interpreter = PDFPageInterpreter(rsrcmgr, device, source_map=source_map)
 
-        for page in PDFPage.get_pages(
-            fp,
-            page_numbers,
-            maxpages=maxpages,
-            password=password,
-            caching=caching,
-        ):
-            interpreter.process_page(page)
+        try:
+            for page in PDFPage.get_pages(
+                fp,
+                page_numbers,
+                maxpages=maxpages,
+                password=password,
+                caching=caching,
+            ):
+                interpreter.process_page(page)
+            device.close()
+        except BaseException:
+            if source_map is not None:
+                source_map.rollback_extraction()
+            raise
 
         text = output_string.getvalue()
         if source_map is not None:
-            source_map.bind_text(text)
+            # commit_extraction verifies that the accumulated converter
+            # writes exactly cover the returned text.
+            source_map.commit_extraction()
         return text
 
 
@@ -270,9 +299,24 @@ def extract_pages(
         interpreter = PDFPageInterpreter(
             resource_manager, device, source_map=source_map
         )
-        for page in PDFPage.get_pages(
-            fp, page_numbers, maxpages=maxpages, password=password, caching=caching
-        ):
-            interpreter.process_page(page)
-            layout = device.get_result()
-            yield layout
+        if source_map is not None:
+            # Open the extraction transaction up front so that reusing this
+            # same map before the layout has been indexed fails early.  The
+            # session is committed later by SourceMap.index_layout /
+            # bind_text; a failed page rolls it back.
+            source_map.begin_extraction()
+        try:
+            for page in PDFPage.get_pages(
+                fp,
+                page_numbers,
+                maxpages=maxpages,
+                password=password,
+                caching=caching,
+            ):
+                interpreter.process_page(page)
+                layout = device.get_result()
+                yield layout
+        except BaseException:
+            if source_map is not None:
+                source_map.rollback_extraction()
+            raise

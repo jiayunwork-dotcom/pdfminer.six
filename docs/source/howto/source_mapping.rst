@@ -60,6 +60,39 @@ The same :class:`~pdfminer.sourcemap.SourceMap` can be passed to
 several pages) to verify the same sources after :class:`~pdfminer.layout.LAParams`
 regrouping.
 
+Reusing a SourceMap and failure semantics
+=========================================
+
+A single :class:`~pdfminer.sourcemap.SourceMap` can be handed to several
+extraction calls in sequence.  Every successful call is an independent
+extraction: it gets a fresh monotonic document id (even for the same file and
+page selection) and its result atomically replaces the previous binding.
+Intervals are half-open ranges over the Unicode characters the text converter
+actually wrote during that call:
+
+* text already present in the output stream before the call is not part of any
+  interval, and the stream never needs to be readable or seekable;
+* for binary output the index follows the exact Unicode segment handed to the
+  encoder, including characters dropped by codec error handling;
+* layout-added spaces, newlines and form feeds remain ``source is None``.
+
+While an extraction is running, queries keep returning the last fully
+committed result.  If interpretation, layout analysis or writing raises, or
+the output stream reports a short write, the attempt is rolled back: the
+previously committed index stays complete and queryable, and a first-ever
+failure leaves the map unbound.  Content already written into the output
+stream is not withdrawn.  Starting a second extraction with the same map
+before the first one finishes raises
+:class:`~pdfminer.pdfexceptions.SourceMapInUseError` before any text is
+written; calls that use separate maps proceed independently.  Calls without a
+``source_map`` argument behave exactly as before.
+
+The boundaries are also available directly through
+:meth:`~pdfminer.sourcemap.SourceMap.begin_extraction`,
+:meth:`~pdfminer.sourcemap.SourceMap.commit_extraction`,
+:meth:`~pdfminer.sourcemap.SourceMap.rollback_extraction` and the
+:meth:`~pdfminer.sourcemap.SourceMap.extraction` context manager.
+
 Memory trade-off
 ================
 

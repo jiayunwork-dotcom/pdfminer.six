@@ -31,3 +31,9 @@ class PDFEOFError(PDFException, EOFError):
 
 class PDFIOError(PDFException, IOError):
     pass
+
+
+class SourceMapInUseError(PDFException):
+    """A SourceMap was asked to start another extraction while one is active."""
+
+    pass

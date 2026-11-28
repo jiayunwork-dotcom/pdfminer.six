@@ -14,8 +14,10 @@ results remain available after the input file is closed.
 
 from __future__ import annotations
 
+import threading
 import weakref
 from array import array
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import count
 from typing import (
@@ -30,7 +32,7 @@ from typing import (
     Tuple,
 )
 
-from .pdfexceptions import PDFValueError
+from .pdfexceptions import PDFValueError, SourceMapInUseError
 
 if TYPE_CHECKING:
     from .layout import LTItem
@@ -276,21 +278,40 @@ class CharacterSource(NamedTuple):
         }
 
 
-class SourceMap:
-    """Document-bound index from final extracted text to native PDF sources."""
+class _ExtractionSession:
+    """Scratch state for one extraction attempt.
 
-    # Monotonic, process-local document binding.  It is intentionally not an
-    # object id or PDF object number, both of which can be reused.
-    _document_ids = count(1)
+    All recording during an extraction happens here.  The scratch buffers are
+    only published onto the owning :class:`SourceMap` by a successful
+    ``commit``; any failure rolls them back and leaves the previously
+    committed index intact.
+    """
 
-    def __init__(self, document_name: Optional[str] = None) -> None:
-        self.document_id = next(SourceMap._document_ids)
+    __slots__ = (
+        "document_id",
+        "document_name",
+        "records",
+        "char_sources",
+        "text_parts",
+        "current_page",
+        "_page_count",
+        "_stream_uids",
+        "_next_stream_uid",
+        "_call_counts",
+        "_code_pool",
+    )
+
+    def __init__(self, document_id: int, document_name: Optional[str]) -> None:
+        self.document_id = document_id
         self.document_name = document_name
 
         self.records: List[NativeSource] = []
         # One signed 32-bit record id per output Unicode code point.
         self.char_sources: "array[int]" = array("i")
-        self.text: Optional[str] = None
+        # Exact Unicode text the text converter actually wrote during this
+        # extraction.  Prefix text already present in the output stream is
+        # never part of it.
+        self.text_parts: List[str] = []
 
         self._page_count = 0
         self.current_page: Optional[PageRef] = None
@@ -301,23 +322,158 @@ class SourceMap:
         self._call_counts: Dict[Tuple[Any, ...], int] = {}
         self._code_pool: Dict[bytes, bytes] = {}
 
+    @property
+    def text(self) -> str:
+        return "".join(self.text_parts)
+
+
+class SourceMap:
+    """Document-bound index from final extracted text to native PDF sources.
+
+    A SourceMap is reusable: each successful extraction replaces the previous
+    committed result as one atomic transaction.  While an extraction is in
+    progress every query keeps seeing the last committed result, and a failed
+    extraction (interpreter/layout/write error or a stream short write) leaves
+    that previous result untouched.
+    """
+
+    # Monotonic, process-local document binding.  It is intentionally not an
+    # object id or PDF object number, both of which can be reused.
+    _document_ids = count(1)
+
+    def __init__(self, document_name: Optional[str] = None) -> None:
+        # document_id/document_name describe the last committed extraction.
+        # They are replaced (never reused) whenever an extraction commits.
+        self.document_id = next(SourceMap._document_ids)
+        self.document_name = document_name
+
+        self.records: List[NativeSource] = []
+        # One signed 32-bit record id per output Unicode code point.
+        self.char_sources: "array[int]" = array("i")
+        self.text: Optional[str] = None
+
+        # Scratch state for the extraction currently in progress, if any.
+        self._session: Optional[_ExtractionSession] = None
+        # Held for the whole duration of an extraction so that a second
+        # extraction using the same map fails before anything is written.
+        self._extraction_lock = threading.Lock()
+
+    # -- extraction transaction boundaries -----------------------------
+
+    def begin_extraction(
+        self, document_name: Optional[str] = None
+    ) -> "_ExtractionSession":
+        """Start a new extraction attempt on this map.
+
+        Raises :class:`SourceMapInUseError` if an earlier extraction using the
+        same map has not finished yet.  The previously committed result stays
+        queryable until the new extraction commits.
+        """
+        if not self._extraction_lock.acquire(blocking=False):
+            raise SourceMapInUseError(
+                "This SourceMap is already serving an in-progress extraction"
+            )
+        try:
+            if document_name is None:
+                document_name = self.document_name
+            self._session = _ExtractionSession(
+                next(SourceMap._document_ids), document_name
+            )
+        except BaseException:
+            self._extraction_lock.release()
+            raise
+        return self._session
+
+    def commit_extraction(self) -> None:
+        """Publish the current extraction, making its result the query view."""
+        session = self._require_session()
+        text = session.text
+        if len(text) != len(session.char_sources):
+            # A failed commit must release the map just like a rollback.
+            self.rollback_extraction()
+            raise PDFValueError(
+                "Source map length "
+                f"{len(session.char_sources)} does not match extracted text length "
+                f"{len(text)}"
+            )
+        # Publish the scratch buffers as one step.  Queries made before this
+        # point saw the previous committed result.
+        self.records = session.records
+        self.char_sources = session.char_sources
+        self.text = text
+        self.document_id = session.document_id
+        self.document_name = session.document_name
+        self._session = None
+        self._extraction_lock.release()
+
+    def rollback_extraction(self) -> None:
+        """Discard the current extraction and keep the committed result."""
+        if self._session is None:
+            return
+        self._session = None
+        self._extraction_lock.release()
+
+    @contextmanager
+    def extraction(self, document_name: Optional[str] = None) -> Iterator[None]:
+        """Context manager wrapping :meth:`begin_extraction`/commit/rollback."""
+        self.begin_extraction(document_name=document_name)
+        try:
+            yield
+        except BaseException:
+            self.rollback_extraction()
+            raise
+        else:
+            self.commit_extraction()
+
+    def _require_session(self) -> _ExtractionSession:
+        if self._session is None:
+            raise PDFValueError(
+                "No extraction is active on this SourceMap; call "
+                "begin_extraction() first"
+            )
+        return self._session
+
+    def _session_or_begin(self) -> _ExtractionSession:
+        """Return the active session, lazily starting one for direct use.
+
+        Code that drives the interpreter/converter directly (rather than
+        through the high-level extraction functions) never calls
+        :meth:`begin_extraction`.  Start an implicit session on the first
+        recording call so that sequence still works.
+
+        A lazily started session continues from the committed state: it
+        adopts the committed records (and their document id) so that
+        :class:`NativeSource` objects already attached to layout items keep
+        valid record ids when a later phase indexes that layout tree without
+        re-parsing the PDF.
+        """
+        if self._session is None:
+            self.begin_extraction()
+            assert self._session is not None
+            session = self._session
+            session.records = list(self.records)
+            if self.text is not None:
+                session.document_id = self.document_id
+        return self._session
+
     # -- extraction/recording API -------------------------------------
 
     def begin_page(self, page: "PDFPage") -> PageRef:
+        session = self._session_or_begin()
         page_index = getattr(page, "page_index", None)
         if page_index is None:
-            page_index = self._page_count
-        self._page_count += 1
+            page_index = session._page_count
+        session._page_count += 1
 
         pageid = getattr(page, "pageid", None)
         page_object_number = pageid if isinstance(pageid, int) else None
-        self.current_page = PageRef(
-            document_id=self.document_id,
+        session.current_page = PageRef(
+            document_id=session.document_id,
             page_index=int(page_index),
             page_number=int(page_index) + 1,
             page_object_number=page_object_number,
         )
-        return self.current_page
+        return session.current_page
 
     def stream_ref(
         self,
@@ -325,6 +481,7 @@ class SourceMap:
         content_index: int = 0,
         kind: Optional[str] = None,
     ) -> StreamRef:
+        session = self._session_or_begin()
         # Resolve an indirect reference if a caller passed one.  Imported here
         # to avoid a circular import at module import time.
         from .pdftypes import PDFObjRef, PDFStream, resolve1
@@ -342,14 +499,14 @@ class SourceMap:
                 kind=kind or "unknown",
             )
 
-        uid = self._stream_uids.get(stream)
+        uid = session._stream_uids.get(stream)
         if uid is None:
-            uid = self._next_stream_uid
-            self._next_stream_uid += 1
-            self._stream_uids[stream] = uid
+            uid = session._next_stream_uid
+            session._next_stream_uid += 1
+            session._stream_uids[stream] = uid
 
         if kind is None:
-            kind = "form-xobject" if self.current_page is not None else "content"
+            kind = "form-xobject" if session.current_page is not None else "content"
         return StreamRef(
             uid=uid,
             object_number=stream.objid,
@@ -366,13 +523,14 @@ class SourceMap:
         xobject: "PDFStream",
         call_order: int,
     ) -> SourceCall:
+        session = self._session_or_begin()
         from .pdftypes import PDFObjRef, resolve1
 
         obj = resolve1(xobject) if isinstance(xobject, PDFObjRef) else xobject
         object_number = getattr(obj, "objid", None)
         generation = getattr(obj, "genno", None)
 
-        assert self.current_page is not None
+        assert session.current_page is not None
         identity: Any
         if object_number is not None:
             identity = ("obj", object_number, generation)
@@ -380,12 +538,12 @@ class SourceMap:
             identity = ("uid", self.stream_ref(obj).uid)
 
         key = (
-            self.current_page.page_index,
+            session.current_page.page_index,
             tuple(parent_path),
             identity,
         )
-        call_index = self._call_counts.get(key, 0)
-        self._call_counts[key] = call_index + 1
+        call_index = session._call_counts.get(key, 0)
+        session._call_counts[key] = call_index + 1
 
         return SourceCall(
             name=name,
@@ -404,14 +562,15 @@ class SourceMap:
         operator: str,
         operator_index: int,
     ) -> OperatorRef:
-        assert self.current_page is not None
+        session = self._session_or_begin()
+        assert session.current_page is not None
         stream_ref = self.stream_ref(
             stream,
             content_index=content_index,
             kind="page-contents" if not path else "form-xobject",
         )
         return OperatorRef(
-            page=self.current_page,
+            page=session.current_page,
             path=tuple(path),
             stream=stream_ref,
             operator=operator,
@@ -429,12 +588,13 @@ class SourceMap:
         cid: Optional[int],
         code: bytes,
     ) -> NativeSource:
+        session = self._session_or_begin()
         # Intern repeated code byte strings: this stores one small bytes object
         # per distinct code rather than allocating a copy for every glyph.
-        pooled_code = self._code_pool.setdefault(code, code)
+        pooled_code = session._code_pool.setdefault(code, code)
         record = NativeSource(
-            record_id=len(self.records),
-            document_id=self.document_id,
+            record_id=len(session.records),
+            document_id=session.document_id,
             operator_ref=operator_ref,
             operand_index=operand_index,
             string_index=string_index,
@@ -443,31 +603,47 @@ class SourceMap:
             cid=cid,
             code=pooled_code,
         )
-        self.records.append(record)
+        session.records.append(record)
         return record
 
     def append_output(self, text: str, source: Any = None) -> None:
-        """Append the source ids for one exact converter text write."""
+        """Record one exact converter text write.
+
+        ``text`` must be the Unicode string actually handed to the output
+        stream (after codec filtering); layout-generated characters pass
+        ``source=None`` and are marked as having no native origin.
+        """
         if not text:
             return
+        session = self._session_or_begin()
         record_id = -1
         if isinstance(source, NativeSource):
             record_id = source.record_id
         elif isinstance(source, int):
             record_id = source
-        if record_id < -1 or record_id >= len(self.records):
+        if record_id < -1 or record_id >= len(session.records):
             raise PDFValueError(f"Source record {record_id} is not in this SourceMap")
-        self.char_sources.extend(array("i", [record_id]) * len(text))
+        session.char_sources.extend(array("i", [record_id]) * len(text))
+        session.text_parts.append(text)
 
     def bind_text(self, text: str) -> None:
-        """Bind the final Unicode text produced by the text converter."""
-        if len(text) != len(self.char_sources):
+        """Bind text for a direct, non-high-level extraction and commit it.
+
+        High-level extraction accumulates the converter's writes itself; this
+        entry point supports callers that drive the interpreter and
+        :class:`~pdfminer.converter.TextConverter` directly.  A length
+        mismatch rolls the attempt back instead of leaving the map busy.
+        """
+        session = self._session_or_begin()
+        if len(text) != len(session.char_sources):
+            self.rollback_extraction()
             raise PDFValueError(
                 "Source map length "
-                f"{len(self.char_sources)} does not match extracted text length "
+                f"{len(session.char_sources)} does not match extracted text length "
                 f"{len(text)}"
             )
-        self.text = text
+        session.text_parts = [text]
+        self.commit_extraction()
 
     # -- layout-tree indexing -----------------------------------------
 
@@ -516,7 +692,9 @@ class SourceMap:
         page_number_text: Optional[str] = None,
     ) -> str:
         """Reset output and index one layout tree in converter traversal order."""
-        self.char_sources = array("i")
+        session = self._session_or_begin()
+        session.char_sources = array("i")
+        session.text_parts = []
         text = self.append_layout(
             root,
             page_break=page_break,
@@ -532,7 +710,9 @@ class SourceMap:
         page_break: bool = True,
     ) -> str:
         """Index several pages and bind their concatenated converter text."""
-        self.char_sources = array("i")
+        session = self._session_or_begin()
+        session.char_sources = array("i")
+        session.text_parts = []
         parts = [
             self.append_layout(root, page_break=page_break) for root in roots
         ]
